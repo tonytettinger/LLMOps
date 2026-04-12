@@ -8,5 +8,6 @@ dependencies = [
     "asyncpg>=0.31.0",
     "langchain-text-splitters>=1.1.1",
     "litellm>=1.83.4",
+    "psycopg2-binary>=2.9.11",
     "python-dotenv>=1.0.1",
 ]
