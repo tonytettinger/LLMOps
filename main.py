@@ -1,60 +1,147 @@
 #!/usr/bin/env python3
 """
-Local ingestion script to test text splitting
-Reads a file from the current directory and prints chunks created by LangChain text splitter
+Ingestion Pipeline for SupportBot
+Loads a single static markdown file into PostgreSQL vector database
 """
 
+import asyncio
+import hashlib
+import json
 import os
-import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
+import asyncpg
+from dotenv import load_dotenv
 from langchain_text_splitters import Language, RecursiveCharacterTextSplitter
+from litellm import embedding
+
+load_dotenv()
+
+class Database:
+    def __init__(self):
+        self.pool = None
+
+    async def connect(self):
+        self.pool = await asyncpg.create_pool(
+            dsn=os.environ["DATABASE_URL"]
+        )
+        print("✅ Database connection pool established")
+
+    async def disconnect(self):
+        if self.pool:
+            await self.pool.close()
+            print("🛑 Database connection pool closed")
+
+    async def get_pool(self):
+        return self.pool
+
+db = Database()
+
+def get_embedding(text: str) -> List[float]:
+    """
+    Converts text into a vector using LiteLLM.
+    """
+    response = embedding(
+        model="text-embedding-3-small",
+        input=[text]
+    )
+    # The response format mimics OpenAI's standard API
+    return response.data[0]["embedding"]
 
 
-def parse_markdown_file(file_path: Path) -> List[str]:
-    """Read and parse a markdown file into chunks using LangChain text splitter."""
-    with open(file_path, "r", encoding="utf-8") as f:
-        text = f.read()
+@dataclass
+class DocumentChunk:
+    page_content: str
+    metadata: Dict[str, str]
 
-    # Initialize the splitter with Markdown-specific rules
-    # chunk_size=1000: Target ~1000 characters per chunk (approx 200-300 tokens)
-    # chunk_overlap=100: Keep 100 chars of context from the previous chunk
+    @property
+    def chunk_id(self) -> str:
+        raw = self.metadata["source"] + self.page_content
+        return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def parse_markdown_file(file_path: Path) -> List[DocumentChunk]:
+    text = file_path.read_text(encoding="utf-8")
+
     splitter = RecursiveCharacterTextSplitter.from_language(
         language=Language.MARKDOWN,
         chunk_size=1000,
-        chunk_overlap=200
+        chunk_overlap=100,
     )
 
-    # The splitter returns LangChain 'Document' objects
     raw_chunks = splitter.create_documents([text])
 
-    # Extract just the text content from each chunk
-    chunks = [chunk.page_content for chunk in raw_chunks]
+    return [
+        DocumentChunk(
+            page_content=chunk.page_content,
+            metadata={
+                "source": file_path.name,
+                "file_path": str(file_path),
+                **chunk.metadata,
+            },
+        )
+        for chunk in raw_chunks
+    ]
 
-    return chunks
 
-def main():
-    """Main function to read a file and print chunks."""
-    file_path = "Nimble_guide.MD"
-
-    print(f"📄 Reading file: {file_path}")
-
-    chunks = parse_markdown_file(file_path)
-
-    print(f"📊 Created {len(chunks)} chunks")
-    print("=" * 80)
-
-    # Print each chunk with metadata
+async def ingest_chunks(chunks: List[DocumentChunk]) -> None:
+    print("🧠 Generating embeddings...")
+    embeddings = []
     for i, chunk in enumerate(chunks, 1):
-        print(f"\n--- Chunk {i} ---")
-        print(f"Length: {len(chunk)} characters")
-        print(f"Content:\n{chunk}")
-        print("-" * 40)
+        if i == 1 or i % 10 == 0 or i == len(chunks):
+            print(f"  Processing chunk {i}/{len(chunks)}")
+        embeddings.append(get_embedding(chunk.page_content))
 
-    print(f"\n✅ Total chunks: {len(chunks)}")
-    print(f"📄 File: {file_path}")
-    print(f"📏 Total characters: {sum(len(chunk) for chunk in chunks)}")
+    records = []
+    for chunk, embed in zip(chunks, embeddings):
+        embedding_str = "[" + ",".join(map(str, embed)) + "]"
+        records.append(
+            (
+                chunk.chunk_id,
+                chunk.page_content,
+                json.dumps(chunk.metadata),
+                embedding_str,
+                chunk.page_content,
+            )
+        )
+
+    print(f"📥 Inserting {len(records)} records into database...")
+    async with db.pool.acquire() as conn:
+        await conn.executemany(
+            """
+            INSERT INTO document_chunks (id, content, metadata, embedding, text_search)
+            VALUES ($1, $2, $3::jsonb, $4::vector, to_tsvector('english', $5))
+            ON CONFLICT (id) DO NOTHING
+            """,
+            records,
+        )
+
+    print(f"✅ Successfully ingested {len(records)} chunks")
+
+
+async def ingest_file(file_path: str) -> None:
+    path = Path(file_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    print(f"📄 Reading file: {path}")
+    chunks = parse_markdown_file(path)
+    print(f"📊 Created {len(chunks)} chunks")
+
+    await ingest_chunks(chunks)
+
+
+async def main() -> None:
+    FILE_TO_INGEST = "Nimble_guide.MD"
+
+    await db.connect()
+    try:
+        await ingest_file(FILE_TO_INGEST)
+    finally:
+        await db.disconnect()
+
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
