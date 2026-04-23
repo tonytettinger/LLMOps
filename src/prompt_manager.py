@@ -3,6 +3,8 @@ from typing import Any, Dict
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
+from src.security.output_rail import OutputValidator
+
 
 class PromptManager:
     def __init__(self, template_dir: str = "src/prompts"):
@@ -17,8 +19,9 @@ class PromptManager:
 
     def parse_response(self, response_text: str) -> Dict[str, Any]:
         """Safe JSON parsing helper with markdown fallback."""
+        cleaned_response_text = OutputValidator().validate(response_text)
         try:
-            return json.loads(response_text)
+            return json.loads(cleaned_response_text)
         except json.JSONDecodeError:
-            cleaned = response_text.replace("```json", "").replace("```", "").strip()
+            cleaned = cleaned_response_text.replace("```json", "").replace("```", "").strip()
             return json.loads(cleaned)
